@@ -57,11 +57,15 @@ const optionalAuth = async (req, res, next) => {
 
   // If testing in development and explicit mock headers provided with bypass flag:
   if (!token && process.env.NODE_ENV !== "production" && req.headers["x-test-user-id"]) {
+    const mockRole = (req.headers["x-test-user-role"] || "citizen").toLowerCase();
     req.user = {
       id: req.headers["x-test-user-id"],
       email: (req.headers["x-test-user-email"] || "").toLowerCase(),
       name: req.headers["x-test-user-name"] || "Test User",
-      role: req.headers["x-test-user-role"] || "citizen",
+      role: mockRole,
+      publicMetadataRole: mockRole,
+      isRoleAdmin: mockRole === "admin",
+      isEmailAdmin: ADMIN_EMAILS.includes((req.headers["x-test-user-email"] || "").toLowerCase()),
     };
     return next();
   }
@@ -94,19 +98,35 @@ const optionalAuth = async (req, res, next) => {
 
     let userEmail = payload.email || payload.primary_email_address || "";
     let userName = payload.name || payload.first_name || "";
+    let publicMetadataRole = null;
 
-    // If email is missing in JWT payload, query Clerk API if secret key available
-    if (!userEmail && clerkClient && process.env.NODE_ENV !== "test") {
+    // Check token payload claims first (if JWT template included publicMetadata or role)
+    if (payload.publicMetadata && typeof payload.publicMetadata.role === "string") {
+      publicMetadataRole = payload.publicMetadata.role;
+    } else if (payload.public_metadata && typeof payload.public_metadata.role === "string") {
+      publicMetadataRole = payload.public_metadata.role;
+    } else if (payload.metadata && typeof payload.metadata.role === "string") {
+      publicMetadataRole = payload.metadata.role;
+    } else if (typeof payload.role === "string") {
+      publicMetadataRole = payload.role;
+    }
+
+    // Query Clerk API if clerkClient is available to fetch authoritative user profile and publicMetadata
+    if (clerkClient && process.env.NODE_ENV !== "test") {
       try {
         const clerkUser = await clerkClient.users.getUser(payload.sub);
         if (clerkUser) {
           userEmail =
             clerkUser.primaryEmailAddress?.emailAddress ||
             clerkUser.emailAddresses?.[0]?.emailAddress ||
-            "";
-          userName = clerkUser.fullName || `${clerkUser.firstName || ""} ${clerkUser.lastName || ""}`.trim();
+            userEmail;
+          userName = clerkUser.fullName || `${clerkUser.firstName || ""} ${clerkUser.lastName || ""}`.trim() || userName;
+          const remoteRole = clerkUser.publicMetadata?.role || clerkUser.public_metadata?.role;
+          if (remoteRole) {
+            publicMetadataRole = remoteRole;
+          }
         }
-      } catch {
+      } catch (clerkErr) {
         // Continue with available claims
       }
     }
@@ -115,11 +135,20 @@ const optionalAuth = async (req, res, next) => {
       userEmail = req.headers["x-user-email"];
     }
 
+    const normalizedEmail = (userEmail || "").toLowerCase().trim();
+    const normalizedPublicRole = String(publicMetadataRole || "").toLowerCase().trim();
+    const isEmailAdmin = Boolean(normalizedEmail && ADMIN_EMAILS.includes(normalizedEmail));
+    const isRoleAdmin = normalizedPublicRole === "admin";
+    const effectiveRole = (isRoleAdmin || isEmailAdmin) ? "admin" : (normalizedPublicRole || "citizen");
+
     req.user = {
       id: payload.sub,
-      email: userEmail.toLowerCase(),
+      email: normalizedEmail,
       name: userName || "Citizen",
-      role: ADMIN_EMAILS.includes(userEmail.toLowerCase()) ? "admin" : "citizen",
+      role: effectiveRole,
+      publicMetadataRole: normalizedPublicRole || null,
+      isRoleAdmin,
+      isEmailAdmin,
     };
 
     return next();
@@ -146,12 +175,28 @@ const requireAuth = async (req, res, next) => {
 
 /**
  * Admin only authorization middleware
- * Never trusts a raw role from the frontend; verifies actual email or verified identity
+ * Verifies authenticated Clerk role (publicMetadata.role === "admin") or preconfigured admin email
  */
 const requireAdmin = async (req, res, next) => {
   await requireAuth(req, res, () => {
-    const userEmail = (req.user?.email || "").toLowerCase();
-    const isAdmin = ADMIN_EMAILS.includes(userEmail) || req.user?.role === "admin";
+    const userRole = (req.user?.role || "").toLowerCase().trim();
+    const publicRole = (req.user?.publicMetadataRole || "").toLowerCase().trim();
+    const userEmail = (req.user?.email || "").toLowerCase().trim();
+
+    const isAdmin =
+      userRole === "admin" ||
+      publicRole === "admin" ||
+      (userEmail && ADMIN_EMAILS.includes(userEmail));
+
+    // Development diagnostics (No secret keys or session tokens logged)
+    console.log("[requireAdmin Diagnostics]", {
+      middleware: "backend/middleware/authMiddleware.js -> requireAdmin",
+      userId: req.user?.id || null,
+      publicMetadataRole: req.user?.publicMetadataRole || "(none)",
+      effectiveRole: userRole,
+      isAllowedAdmin: Boolean(isAdmin),
+      decision: isAdmin ? "ALLOW (Admin Authorized)" : "DENY_403 (Citizen Restricted)",
+    });
 
     if (!isAdmin) {
       return res.status(403).json({

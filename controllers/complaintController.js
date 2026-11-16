@@ -405,7 +405,11 @@ const deleteComplaint = async (req, res, next) => {
     // Check authorization: only admin or the user who created it can delete
     const userEmail = (req.user?.email || "").toLowerCase();
     const isOwner = req.user && (req.user.id === complaint.userId || (userEmail && userEmail === (complaint.userEmail || "").toLowerCase()));
-    const isAdmin = req.user && (ADMIN_EMAILS.includes(userEmail) || req.user.role === "admin");
+    const isAdmin =
+      req.user &&
+      (req.user.role === "admin" ||
+        req.user.publicMetadataRole === "admin" ||
+        ADMIN_EMAILS.includes(userEmail));
 
     if (!isOwner && !isAdmin) {
       return res.status(403).json({
